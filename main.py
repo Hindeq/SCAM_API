@@ -226,8 +226,38 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
     # Assemblage final
     final_vector = []
-    feature_list_slim_92 = [
-        # ... la liste complète des 92 features comme dans ton code précédent ...
+    feature_list_slim_92 =         
+        "tBodyAccJerk-std()-X", "tBodyAccJerkMag-energy()", "fBodyAccJerk-bandsEnergy()-1,16",
+        "fBodyAccJerk-max()-X", "fBodyAccJerk-bandsEnergy()-1,24", "tBodyGyroJerk-mad()-Z",
+        "fBodyAccJerk-bandsEnergy()-1,16", "fBodyAccJerk-std()-X", "fBodyAcc-entropy()-X",
+        "fBodyAcc-mad()-X", "tBodyAccJerk-sma()", "fBodyAccJerk-mean()-X",
+        "tBodyGyroJerk-sma()", "tBodyAccJerk-iqr()-X", "tBodyGyroJerk-iqr()-Z",
+        "fBodyAccJerk-mean()-Y", "tBodyAcc-correlation()-X,Y", "tBodyAccJerkMag-sma()",
+        "tBodyGyroJerk-iqr()-X", "tBodyAccJerk-mad()-Y", "fBodyAccJerk-max()-Y",
+        "fBodyAcc-bandsEnergy()-9,16", "fBodyAccJerk-mad()-X", "fBodyAccJerk-bandsEnergy()-9,16",
+        "tBodyAccJerk-entropy()-Y", "fBodyAccJerk-energy()-X", "tGravityAccMag-arCoeff()1",
+        "tGravityAcc-arCoeff()-X,1", "fBodyAcc-energy()-X", "tBodyAccMag-arCoeff()1",
+        "tGravityAcc-arCoeff()-X,3", "tBodyAcc-max()-X", "tGravityAcc-arCoeff()-X,2",
+        "fBodyAcc-mean()-X", "fBodyAccMag-std()", "tBodyAccJerkMag-iqr()",
+        "fBodyAccJerk-maxInds-X", "fBodyAcc-bandsEnergy()-1,16", "tGravityAcc-arCoeff()-X,4",
+        "fBodyAccJerk-mad()-Y", "tBodyGyroJerkMag-mean()", "fBodyAccJerk-bandsEnergy()-1,8",
+        "tBodyGyroJerk-iqr()-Y", "fBodyAccJerk-entropy()-Y", "tBodyAccJerkMag-mean()",
+        "fBodyAccMag-entropy()", "tBodyAccJerk-entropy()-X", "fBodyAccJerk-entropy()-X",
+        "tBodyAccJerk-energy()-X", "tBodyGyroJerk-entropy()-Z", "fBodyBodyAccJerkMag-mean()",
+        "tBodyAccJerk-mad()-Z", "fBodyAcc-iqr()-X", "tBodyGyro-iqr()-Y",
+        "tGravityAcc-arCoeff()-Z,1", "fBodyAcc-bandsEnergy()-1,8", "tGravityAcc-mad()-X",
+        "tGravityAccMag-std()", "tGravityAcc-arCoeff()-Z,2", "tBodyAccMag-arCoeff()2",
+        "fBodyAccMag-mad()", "fBodyAccMag-max()", "tBodyAccMag-mad()",
+        "fBodyGyro-maxInds-Z", "tGravityAcc-mad()-Y", "fBodyAcc-bandsEnergy()-1,24",
+        "fBodyAcc-std()-X", "tGravityAcc-arCoeff()-Y,1", "tGravityAcc-arCoeff()-Y,2",
+        "fBodyGyro-maxInds-X", "tGravityAcc-arCoeff()-Y,4", "tGravityAcc-std()-X",
+        "tGravityAcc-arCoeff()-Z,3", "tGravityAcc-entropy()-X", "tBodyAcc-std()-X",
+        "fBodyAcc-max()-X", "tBodyAccMag-std()", "fBodyAccMag-meanFreq()",
+        "tGravityAcc-arCoeff()-Y,3", "tGravityAccMag-mad()", "tGravityAccMag-sma()",
+        "fBodyAccMag-energy()", "tBodyAccMag-energy()", "tBodyAccJerk-correlation()-X,Y",
+        "tGravityAcc-std()-Y", "tBodyGyroJerk-mad()-X", "fBodyAccMag-sma()",
+        "tGravityAcc-min()-X", "tGravityAcc-mean()-X", "tBodyAcc-mad()-X",
+        "tGravityAcc-mad()-Z", "fBodyAcc-meanFreq()-Z"
     ]
 
     for name in feature_list_slim_92:
