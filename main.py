@@ -11,7 +11,7 @@ import math
 import logging
 import os # Import pour les variables d'environnement
 from datetime import datetime
-from typing import Optional
+
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
@@ -52,7 +52,7 @@ class SensorData(BaseModel):
     gyro_z: float
     bpm: float
     spo2: float
-    timestamp: Optional[datetime] = None
+    timestamp: datetime 
 
 app = FastAPI()
 
@@ -87,9 +87,14 @@ def signal_energy(signal):
     return np.sum(signal**2) / len(signal)
 
 def signal_entropy(signal):
+    if len(signal) == 0 or np.all(signal == signal[0]):
+        return 0.0  # Signal vide ou constant
     hist, _ = np.histogram(signal, bins=10, density=True)
-    hist = hist[hist > 0]
-    return -np.sum(hist * np.log2(hist)) if len(hist) > 1 else 0.0
+    hist = hist[hist > 0]  # Ignorer bins vides
+    if len(hist) == 0:
+        return 0.0
+    return -np.sum(hist * np.log2(hist))
+
 
 def weighted_mean_freq(fft_vals, freqs):
     return np.sum(fft_vals * freqs) / np.sum(fft_vals) if np.sum(fft_vals) > 0 else 0
