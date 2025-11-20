@@ -320,23 +320,51 @@ def model_predict_nap(features):
 def analyze_vitals(data: SensorData):
     try:
         # Génération des buffers pour SLIM (simulation)
-        ppg_buffer = np.array([data.bpm] * 800)  # remplacer 800 par la taille attendue
-        acc_buffer = np.array([[data.accel_x, data.accel_y, data.accel_z]] * 400)
-        gyro_buffer = np.array([[data.gyro_x, data.gyro_y, data.gyro_z]] * 400)
+       ppg_buffer = data.bpm + np.random.normal(0, 2, 800)  # variation autour du bpm
+       acc_buffer = np.array([
+            [data.accel_x, data.accel_y, data.accel_z] + np.random.normal(0, 0.2, 3)
+            for _ in range(400)
+       ])
+       gyro_buffer = np.array([
+        [data.gyro_x, data.gyro_y, data.gyro_z] + np.random.normal(0, 1.0, 3)
+        for _ in range(400)
+       ])
+
 
         # Estimation FC corrigée
-        fc_corrigee = estimate_fc_corrected(ppg_buffer, acc_buffer)
+        motion_magnitude = np.linalg.norm(acc_buffer, axis=1)
+        max_motion = np.max(motion_magnitude)
+
+        if max_motion > 2.5:
+            fc_corrigee = data.bpm * 1.1  # mouvement intense → bpm corrigé plus haut
+        elif max_motion > 1.5:
+            fc_corrigee = data.bpm * 1.05
+        else:
+            fc_corrigee = data.bpm
+
 
         # Calcul des features et prédiction NAP
         features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
-        nap_mouvement = model_predict_nap(features_92)
+        total_accel = np.max(np.linalg.norm(acc_buffer, axis=1))
+        if total_accel > 2.5:
+            nap_mouvement = 2  # chute
+        elif total_accel > 1.5:
+            nap_mouvement = 1  # mouvement important
+        else:
+            nap_mouvement = 0  # normal
+
 
         # Classification finale
-        statut_anomalie = "Normal"
-        alerte_active = False
-        if nap_mouvement == 0 and fc_corrigee > SEUIL_FC_STRESS:
-            statut_anomalie = "ALERTE: Stress Mental Sévère"
+        if nap_mouvement == 2 or fc_corrigee > 110 or data.spo2 < 90:
+            statut_anomalie = "Critique"
             alerte_active = True
+        elif nap_mouvement == 1 or fc_corrigee > 100 or data.spo2 < 95:
+            statut_anomalie = "Alerte"
+            alerte_active = True
+        else:
+            statut_anomalie = "Normal"
+            alerte_active = False
+
 
         # Payload Supabase
         result_payload = {
