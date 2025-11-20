@@ -11,7 +11,7 @@ import math
 import logging
 import os # Import pour les variables d'environnement
 from datetime import datetime
-
+from typing import Optional
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
