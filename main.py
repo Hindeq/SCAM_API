@@ -86,15 +86,38 @@ def signal_magnitude_area(signal):
 def signal_energy(signal):
     return np.sum(signal**2) / len(signal)
 
-def signal_entropy(signal):
-    if len(signal) == 0:
+def signal_entropy(signal, bins=10):
+    """
+    Calcul sécurisé de l'entropie d'un signal (proxy pour complexité).
+    
+    Args:
+        signal (array-like): Le signal à analyser.
+        bins (int): Nombre de bins pour l'histogramme.
+    
+    Returns:
+        float: Entropie positive ou 0 si signal constant/vide.
+    """
+    signal = np.asarray(signal)
+    
+    if signal.size == 0:
+        return 0.0  # Signal vide
+    
+    # Si le signal est constant, renvoyer 0
+    if np.all(signal == signal[0]):
         return 0.0
-    if np.all(signal == signal[0]):  # signal constant
+
+    # Histogramme sécurisé
+    try:
+        hist, _ = np.histogram(signal, bins=bins, density=True)
+        hist = hist[hist > 0]  # Ignorer les bins vides
+        if len(hist) == 0:
+            return 0.0
+        entropy = -np.sum(hist * np.log2(hist))
+        return float(entropy)
+    except Exception as e:
+        # En cas d'erreur imprévue
         return 0.0
-    bins = min(10, len(signal))      # pas plus de bins que de points
-    hist, _ = np.histogram(signal, bins=bins, density=True)
-    hist = hist[hist > 0]
-    return -np.sum(hist * np.log2(hist))
+
 
 
 def weighted_mean_freq(fft_vals, freqs):
