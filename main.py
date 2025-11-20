@@ -52,7 +52,7 @@ class SensorData(BaseModel):
     gyro_z: float
     bpm: float
     spo2: float
-    timestamp: datetime 
+    timestamp: Optional[datetime] = None
 
 app = FastAPI()
 
