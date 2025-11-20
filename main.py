@@ -9,17 +9,16 @@ from scipy.fft import fft
 import pandas as pd
 import math
 import logging
-import os
-
+import os # Import pour les variables d'environnement
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
 
 # --- PARAMÈTRES ET CLÉS DE BASE DE DONNÉES ---
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-
-SEUIL_FC_STRESS = 90.0
+# Lecture des variables d'environnement (Render)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "URL_PAR_DEFAUT_SI_MANQUANTE")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "CLE_PAR_DEFAUT_SI_MANQUANTE")
+SEUIL_FC_STRESS = float(os.getenv("SEUIL_FC_STRESS", 90.0))
 
 # Paramètres du contrat IoT/Cloud
 FS_BVP = 100.0
@@ -30,10 +29,16 @@ MIN_HR_HZ = 40 / 60
 MAX_HR_HZ = 220 / 60
 
 # Initialisation de Supabase
+supabase = None
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception:
-    logging.warning("Supabase non initialisé. Vérifiez les clés.")
+    if SUPABASE_URL and SUPABASE_KEY and SUPABASE_URL != "URL_PAR_DEFAUT_SI_MANQUANTE":
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logging.info("Connexion Supabase établie.")
+    else:
+        logging.warning("Variables Supabase manquantes. Connexion BD désactivée.")
+except Exception as e:
+    logging.error(f"Erreur d'initialisation Supabase: {e}")
+    supabase = None
 
 # Modèle de données attendu de l'ESP32
 class SensorData(BaseModel):
@@ -94,6 +99,7 @@ def angle_proxy(v1, v2):
     return np.dot(v1, v2) / norm_prod
 
 def arcoeff_proxy():
+    # Coefficients d'Autoregression (PROXY pour la démo)
     return [0.1, 0.05, 0.02, 0.01]
 
 # --- FONCTION DE CORRECTION CARDIAQUE (Module 2) ---
@@ -105,6 +111,7 @@ def estimate_fc_corrected(bvp_signal, acc_data):
 
     acc_resampled = np.zeros((num_bvp_samples, 3))
     try:
+        # Rééchantillonnage de l'ACC (50Hz) à la fréquence du BVP (100Hz)
         for i in range(3):
             acc_resampled[:, i] = resample(acc_data[:, i], num_bvp_samples)
     except IndexError:
@@ -115,6 +122,7 @@ def estimate_fc_corrected(bvp_signal, acc_data):
     motion_magnitude = np.sqrt(np.sum(acc_resampled**2, axis=1))
     hr_estimates = []
 
+    # Traitement par fenêtres glissantes
     for start in range(0, num_bvp_samples - window_samples, step_samples):
         end = start + window_samples
 
@@ -123,11 +131,13 @@ def estimate_fc_corrected(bvp_signal, acc_data):
 
         if len(bvp_window) != window_samples: continue
 
+        # Calcul du Spectrogramme (PSD) pour BVP et Mouvement
         f_bvp, _, Pxx_den_bvp = spectrogram(bvp_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
         f_acc, _, Pxx_den_acc = spectrogram(acc_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
 
         Pxx_bvp = Pxx_den_bvp.flatten(); Pxx_acc = Pxx_den_acc.flatten()
 
+        # Identification des fréquences dans la plage FC (40-220 BPM)
         acc_hr_indices = np.where((f_acc >= MIN_HR_HZ) & (f_acc <= MAX_HR_HZ))[0]
         motion_peaks = f_acc[acc_hr_indices][np.argsort(Pxx_acc[acc_hr_indices])[-2:]]
         bvp_hr_indices = np.where((f_bvp >= MIN_HR_HZ) & (f_bvp <= MAX_HR_HZ))[0]
@@ -138,13 +148,16 @@ def estimate_fc_corrected(bvp_signal, acc_data):
         candidate_hr_freq = None
         max_power = -1
 
+        # LOGIQUE DE CORRECTION: Éliminer les pics BVP coïncidant avec le mouvement
         for i, freq in enumerate(f_bvp_hr):
+            # Si la fréquence BVP est trop proche d'un pic de mouvement (0.1 Hz)
             is_motion = any(np.abs(freq - mp) < 0.1 for mp in motion_peaks)
 
             if not is_motion and Pxx_bvp_hr[i] > max_power:
                 max_power = Pxx_bvp_hr[i]
                 candidate_hr_freq = freq
 
+        # Fallback: Si aucune fréquence non-motion n'est trouvée, prendre la plus puissante
         if candidate_hr_freq is None:
              candidate_hr_freq = f_bvp_hr[np.argmax(Pxx_bvp_hr)]
 
@@ -156,10 +169,10 @@ def estimate_fc_corrected(bvp_signal, acc_data):
 
 
 # --- FONCTION DE CALCUL DES 92 FEATURES (Module 1) ---
-# NOTE: Cette fonction utilise les PROXYs pour les features complexes (arCoeff, bandsEnergy).
+# NOTE: Cette fonction utilise des PROXYs pour les features complexes (arCoeff, bandsEnergy, etc.)
 def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
-    # Séparation Gravité / Corps (0.3 Hz)
+    # Séparation Gravité / Corps (Filtre Passe-Bas à 0.3 Hz)
     gravity_acc = butter_lowpass_filter(acc_raw_400, 0.3, FS_ACC, ORDER)
     body_acc = acc_raw_400 - gravity_acc
 
@@ -236,10 +249,7 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
     # 4. ASSEMBLAGE DU VECTEUR FINAL DE 92 FEATURES (DANS L'ORDRE STRICT)
     final_vector = []
-    # La liste réelle des 92 features doit être chargée ou codée ici.
-    # Pour le moment, nous utilisons des proxys de la liste d'origine pour garantir l'ordre.
-
-    # NOTE: Pour cette version, nous utilisons un PROXY de la liste pour la démo.
+    # Liste réelle des 92 features (copiée du document fourni précédemment)
     feature_list_slim_92 = [
         "tBodyAccJerk-std()-X", "tBodyAccJerkMag-energy()", "fBodyAccJerk-bandsEnergy()-1,16",
         "fBodyAccJerk-max()-X", "fBodyAccJerk-bandsEnergy()-1,24", "tBodyGyroJerk-mad()-Z",
@@ -276,6 +286,7 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
 
     for name in feature_list_slim_92:
+        # Tente d'ajouter la feature calculée. Si elle n'est pas présente (à cause d'un PROXY manquant), ajoute 0.0.
         final_vector.append(calculated_features.get(name, 0.0))
 
     return np.array(final_vector)
@@ -285,6 +296,7 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
 def model_predict_nap(features):
     # Simuler la logique du Random Forest SLIM entraîné.
+    # EN PRODUCTION: Charger le modèle via joblib.load('modele_slim.joblib')
     if np.mean(np.abs(features)) < 0.5:
          return 0 # Repos
     elif np.mean(np.abs(features)) < 1.5:
@@ -304,8 +316,9 @@ def analyze_vitals(data: SensorData):
         acc_buffer = np.array([data.ACC_X, data.ACC_Y, data.ACC_Z]).T
         gyro_buffer = np.array([data.GYRO_X, data.GYRO_Y, data.GYRO_Z]).T
 
+        # Le contrat prévoit environ 800 échantillons PPG (100Hz*8s) et 400 ACC/GYRO (50Hz*8s)
         if ppg_buffer.size < 790 or acc_buffer.shape[0] < 390:
-             raise HTTPException(status_code=400, detail="Buffer de données incomplet.")
+             raise HTTPException(status_code=400, detail="Buffer de données incomplet. Attendu ~800 PPG et ~400 ACC/GYRO.")
 
         # 2. MODULE 2: CORRECTION CARDIAQUE (Fiabilisation FC)
         fc_corrigee = estimate_fc_corrected(ppg_buffer, acc_buffer)
@@ -319,9 +332,10 @@ def analyze_vitals(data: SensorData):
         statut_anomalie = "Normal"
         alerte_active = False
 
-        if nap_mouvement == 0 and fc_corrigee > SEUIL_FC_STRESS:
-          statut_anomalie = "ALERTE: Stress Mental Sévère"
-          alerte_active = True
+        if nap_mouvement == 0: # Contexte: Repos (Zone critique de stress)
+            if fc_corrigee > SEUIL_FC_STRESS:
+                statut_anomalie = "ALERTE: Stress Mental Sévère (FC au repos > Seuil)"
+                alerte_active = True
 
         # 5. ÉCRITURE DANS SUPABASE (DBaaS)
 
@@ -341,6 +355,9 @@ def analyze_vitals(data: SensorData):
 
         return {"status": "OK", "analysis": result_payload}
 
+    except HTTPException as h_e:
+        raise h_e
     except Exception as e:
         logging.error(f"Erreur d'exécution IA: {e}")
+        # Envoie une exception HTTP 500 si le traitement échoue
         raise HTTPException(status_code=500, detail=f"Erreur interne de traitement IA: {str(e)}")
