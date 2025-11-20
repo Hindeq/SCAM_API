@@ -226,7 +226,7 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
     # Assemblage final
     final_vector = []
-    feature_list_slim_92 =         
+    feature_list_slim_92 = [     
         "tBodyAccJerk-std()-X", "tBodyAccJerkMag-energy()", "fBodyAccJerk-bandsEnergy()-1,16",
         "fBodyAccJerk-max()-X", "fBodyAccJerk-bandsEnergy()-1,24", "tBodyGyroJerk-mad()-Z",
         "fBodyAccJerk-bandsEnergy()-1,16", "fBodyAccJerk-std()-X", "fBodyAcc-entropy()-X",
