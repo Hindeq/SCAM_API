@@ -7,28 +7,27 @@ from scipy.signal import resample, spectrogram, butter, filtfilt
 from scipy.stats import iqr, skew, kurtosis
 from scipy.fft import fft
 import pandas as pd
-import math
 import logging
-import os # Import pour les variables d'environnement
+import os
+import math
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
 
 # --- PARAMÈTRES ET CLÉS DE BASE DE DONNÉES ---
-# Lecture des variables d'environnement (Render)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "URL_PAR_DEFAUT_SI_MANQUANTE")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "URL_PAR_DEFAUT_SI_MANQUANTE") 
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "CLE_PAR_DEFAUT_SI_MANQUANTE")
 SEUIL_FC_STRESS = float(os.getenv("SEUIL_FC_STRESS", 90.0))
 
 # Paramètres du contrat IoT/Cloud
-FS_BVP = 100.0
-FS_ACC = 50.0
-WINDOW_SEC = 8
-ORDER = 3
-MIN_HR_HZ = 40 / 60
+FS_BVP = 100.0      
+FS_ACC = 50.0       
+WINDOW_SEC = 8      
+ORDER = 3 
+MIN_HR_HZ = 40 / 60 
 MAX_HR_HZ = 220 / 60
 
-# Initialisation de Supabase
+# Initialisation de Supabase (hors fonction pour le démarrage)
 supabase = None
 try:
     if SUPABASE_URL and SUPABASE_KEY and SUPABASE_URL != "URL_PAR_DEFAUT_SI_MANQUANTE":
@@ -40,6 +39,25 @@ except Exception as e:
     logging.error(f"Erreur d'initialisation Supabase: {e}")
     supabase = None
 
+# Déclaration de l'application FastAPI
+app = FastAPI()
+
+# --- MODULE 1: MODÈLE ML (Chargement au démarrage du serveur) ---
+RF_CLASSIFIER_SLIM = None
+MODEL_FILE = 'nap_random_forest_model_slim_90.joblib' 
+
+@app.on_event("startup")
+async def startup_event():
+    global RF_CLASSIFIER_SLIM
+    try:
+        # Tenter de charger le modèle SLIM (doit être présent à la racine du dépôt)
+        RF_CLASSIFIER_SLIM = joblib.load(MODEL_FILE)
+        logging.info(f"Modèle SLIM NAP ({MODEL_FILE}) chargé avec succès.")
+    except FileNotFoundError:
+        logging.error(f"Erreur: Fichier modèle joblib non trouvé. La prédiction NAP sera simulée.")
+    except Exception as e:
+        logging.error(f"Erreur lors du chargement de joblib: {e}")
+
 # Modèle de données attendu de l'ESP32
 class SensorData(BaseModel):
     PPG_IR: list[float]
@@ -49,8 +67,6 @@ class SensorData(BaseModel):
     GYRO_X: list[float]
     GYRO_Y: list[float]
     GYRO_Z: list[float]
-
-app = FastAPI()
 
 # --- FONCTIONS DE BASE DE FEATURE ENGINEERING (Module 1) ---
 
@@ -99,7 +115,6 @@ def angle_proxy(v1, v2):
     return np.dot(v1, v2) / norm_prod
 
 def arcoeff_proxy():
-    # Coefficients d'Autoregression (PROXY pour la démo)
     return [0.1, 0.05, 0.02, 0.01]
 
 # --- FONCTION DE CORRECTION CARDIAQUE (Module 2) ---
@@ -108,41 +123,42 @@ def estimate_fc_corrected(bvp_signal, acc_data):
     num_bvp_samples = bvp_signal.size
     window_samples = int(WINDOW_SEC * FS_BVP)
     step_samples = int(WINDOW_SEC * FS_BVP / 4)
-
+        
     acc_resampled = np.zeros((num_bvp_samples, 3))
+    
+    # Resample de l'ACC (50Hz) à la fréquence du BVP (100Hz)
     try:
-        # Rééchantillonnage de l'ACC (50Hz) à la fréquence du BVP (100Hz)
         for i in range(3):
-            acc_resampled[:, i] = resample(acc_data[:, i], num_bvp_samples)
+            acc_resampled[:, i] = resample(acc_data[:, i], num_bvp_samples) 
     except IndexError:
-        return 0.0
+        return 0.0 
     except ValueError:
-        return 0.0
+        return 0.0 
 
     motion_magnitude = np.sqrt(np.sum(acc_resampled**2, axis=1))
     hr_estimates = []
-
+    
     # Traitement par fenêtres glissantes
     for start in range(0, num_bvp_samples - window_samples, step_samples):
         end = start + window_samples
-
+        
         bvp_window = bvp_signal[start:end]
         acc_window = motion_magnitude[start:end]
-
+        
         if len(bvp_window) != window_samples: continue
 
         # Calcul du Spectrogramme (PSD) pour BVP et Mouvement
         f_bvp, _, Pxx_den_bvp = spectrogram(bvp_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
         f_acc, _, Pxx_den_acc = spectrogram(acc_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
-
+        
         Pxx_bvp = Pxx_den_bvp.flatten(); Pxx_acc = Pxx_den_acc.flatten()
-
-        # Identification des fréquences dans la plage FC (40-220 BPM)
+        
+        # Identification des fréquences de bruit (Top 2 pics de mouvement)
         acc_hr_indices = np.where((f_acc >= MIN_HR_HZ) & (f_acc <= MAX_HR_HZ))[0]
-        motion_peaks = f_acc[acc_hr_indices][np.argsort(Pxx_acc[acc_hr_indices])[-2:]]
+        motion_peaks = f_acc[acc_hr_indices][np.argsort(Pxx_den_acc[acc_hr_indices])[-2:]] 
         bvp_hr_indices = np.where((f_bvp >= MIN_HR_HZ) & (f_bvp <= MAX_HR_HZ))[0]
         Pxx_bvp_hr = Pxx_den_bvp[bvp_hr_indices]; f_bvp_hr = f_bvp[bvp_hr_indices]
-
+        
         if len(f_bvp_hr) == 0: continue
 
         candidate_hr_freq = None
@@ -150,36 +166,35 @@ def estimate_fc_corrected(bvp_signal, acc_data):
 
         # LOGIQUE DE CORRECTION: Éliminer les pics BVP coïncidant avec le mouvement
         for i, freq in enumerate(f_bvp_hr):
-            # Si la fréquence BVP est trop proche d'un pic de mouvement (0.1 Hz)
-            is_motion = any(np.abs(freq - mp) < 0.1 for mp in motion_peaks)
-
+            is_motion = any(np.abs(freq - mp) < 0.1 for mp in motion_peaks) 
+            
             if not is_motion and Pxx_bvp_hr[i] > max_power:
                 max_power = Pxx_bvp_hr[i]
                 candidate_hr_freq = freq
-
+        
         # Fallback: Si aucune fréquence non-motion n'est trouvée, prendre la plus puissante
-        if candidate_hr_freq is None:
+        if candidate_hr_freq is None: 
              candidate_hr_freq = f_bvp_hr[np.argmax(Pxx_bvp_hr)]
 
         hr_estimates.append(candidate_hr_freq * 60)
-
+    
     if not hr_estimates:
         return 0.0
     return np.mean(hr_estimates)
 
 
 # --- FONCTION DE CALCUL DES 92 FEATURES (Module 1) ---
-# NOTE: Cette fonction utilise des PROXYs pour les features complexes (arCoeff, bandsEnergy, etc.)
-def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
-    # Séparation Gravité / Corps (Filtre Passe-Bas à 0.3 Hz)
+def calculate_slim_features(acc_raw_400, gyro_raw_400):
+    
+    # Séparation Gravité / Corps (0.3 Hz)
     gravity_acc = butter_lowpass_filter(acc_raw_400, 0.3, FS_ACC, ORDER)
     body_acc = acc_raw_400 - gravity_acc
-
+    
     # Jerk (Dérivée)
     body_acc_jerk = compute_jerk(body_acc, FS_ACC)
     body_gyro_jerk = compute_jerk(gyro_raw_400, FS_ACC)
-
+    
     # Magnitudes (1D)
     tBodyAccMag = compute_magnitude(body_acc)
     tGravityAccMag = compute_magnitude(gravity_acc)
@@ -187,9 +202,9 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
     tBodyGyroMag = compute_magnitude(gyro_raw_400)
     tBodyGyroJerkMag = compute_magnitude(body_gyro_jerk)
 
-    signals_3d = {'tBodyAcc': body_acc, 'tGravityAcc': gravity_acc, 'tBodyAccJerk': body_acc_jerk,
+    signals_3d = {'tBodyAcc': body_acc, 'tGravityAcc': gravity_acc, 'tBodyAccJerk': body_acc_jerk, 
                   'tBodyGyro': gyro_raw_400, 'tBodyGyroJerk': body_gyro_jerk}
-    signals_1d = {'tBodyAccMag': tBodyAccMag, 'tGravityAccMag': tGravityAccMag, 'tBodyAccJerkMag': tBodyAccJerkMag,
+    signals_1d = {'tBodyAccMag': tBodyAccMag, 'tGravityAccMag': tGravityAccMag, 'tBodyAccJerkMag': tBodyAccJerkMag, 
                   'tBodyGyroMag': tBodyGyroMag, 'tBodyGyroJerkMag': tBodyGyroJerkMag}
 
     calculated_features = {}
@@ -206,7 +221,7 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
             calculated_features[f'{name}-max()-{axis}'] = np.max(sig[:, i])
             for j, val in enumerate(arcoeff_proxy()): # arCoeff PROXY
                  calculated_features[f'{name}-arCoeff()-{axis},{j+1}'] = val
-
+                 
     for name, sig in signals_1d.items():
         calculated_features[f'{name}-mean()'] = np.mean(sig)
         calculated_features[f'{name}-std()'] = np.std(sig)
@@ -218,13 +233,13 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
         for j, val in enumerate(arcoeff_proxy()): # arCoeff PROXY
              calculated_features[f'{name}-arCoeff(){j+1}'] = val
 
-    # 2. CALCUL FFT DOMAIN
+    # 2. CALCUL FFT DOMAIN 
     fft_results = {}
     for name in ['tBodyAcc', 'tBodyAccJerk', 'tBodyGyro']:
         for i, axis in enumerate(['X', 'Y', 'Z']):
             fft_vals, freqs = compute_fft(signals_3d[name][:, i], FS_ACC)
             fft_results[f'f{name[1:]}-{axis}'] = (fft_vals, freqs)
-
+            
             f_name = f'f{name[1:]}'
             calculated_features[f'{f_name}-mean()-{axis}'] = np.mean(fft_vals)
             calculated_features[f'{f_name}-std()-{axis}'] = np.std(fft_vals)
@@ -234,89 +249,92 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
             calculated_features[f'{f_name}-maxInds-{axis}'] = np.argmax(fft_vals)
 
             # PROXY pour bandsEnergy
-            calculated_features[f'{f_name}-bandsEnergy()-1,16'] = bands_energy_proxy(fft_vals)
-            calculated_features[f'{f_name}-bandsEnergy()-1,24'] = bands_energy_proxy(fft_vals)
-            calculated_features[f'{f_name}-bandsEnergy()-9,16'] = bands_energy_proxy(fft_vals)
-
+            calculated_features[f'{f_name}-bandsEnergy()-1,16'] = bands_energy_proxy(fft_vals) 
+            calculated_features[f'{f_name}-bandsEnergy()-1,24'] = bands_energy_proxy(fft_vals) 
+            calculated_features[f'{f_name}-bandsEnergy()-9,16'] = bands_energy_proxy(fft_vals) 
+            
     # 3. CALCUL DES ANGLES & CORRELATION
     gravity_mean = np.mean(gravity_acc, axis=0)
     body_acc_mean = np.mean(body_acc, axis=0)
     body_acc_jerk_mean = np.mean(body_acc_jerk, axis=0)
-
+    
     calculated_features['angle(tBodyAccMean,gravity)'] = angle_proxy(body_acc_mean, gravity_mean)
     calculated_features['angle(tBodyAccJerkMean),gravityMean)'] = angle_proxy(body_acc_jerk_mean, gravity_mean)
     calculated_features['tBodyAcc-correlation()-X,Y'] = 0.0 # PROXY
-
+    
     # 4. ASSEMBLAGE DU VECTEUR FINAL DE 92 FEATURES (DANS L'ORDRE STRICT)
     final_vector = []
     # Liste réelle des 92 features (copiée du document fourni précédemment)
     feature_list_slim_92 = [
-        "tBodyAccJerk-std()-X", "tBodyAccJerkMag-energy()", "fBodyAccJerk-bandsEnergy()-1,16",
-        "fBodyAccJerk-max()-X", "fBodyAccJerk-bandsEnergy()-1,24", "tBodyGyroJerk-mad()-Z",
-        "fBodyAccJerk-bandsEnergy()-1,16", "fBodyAccJerk-std()-X", "fBodyAcc-entropy()-X",
-        "fBodyAcc-mad()-X", "tBodyAccJerk-sma()", "fBodyAccJerk-mean()-X",
-        "tBodyGyroJerk-sma()", "tBodyAccJerk-iqr()-X", "tBodyGyroJerk-iqr()-Z",
-        "fBodyAccJerk-mean()-Y", "tBodyAcc-correlation()-X,Y", "tBodyAccJerkMag-sma()",
-        "tBodyGyroJerk-iqr()-X", "tBodyAccJerk-mad()-Y", "fBodyAccJerk-max()-Y",
-        "fBodyAcc-bandsEnergy()-9,16", "fBodyAccJerk-mad()-X", "fBodyAccJerk-bandsEnergy()-9,16",
-        "tBodyAccJerk-entropy()-Y", "fBodyAccJerk-energy()-X", "tGravityAccMag-arCoeff()1",
-        "tGravityAcc-arCoeff()-X,1", "fBodyAcc-energy()-X", "tBodyAccMag-arCoeff()1",
-        "tGravityAcc-arCoeff()-X,3", "tBodyAcc-max()-X", "tGravityAcc-arCoeff()-X,2",
-        "fBodyAcc-mean()-X", "fBodyAccMag-std()", "tBodyAccJerkMag-iqr()",
-        "fBodyAccJerk-maxInds-X", "fBodyAcc-bandsEnergy()-1,16", "tGravityAcc-arCoeff()-X,4",
-        "fBodyAccJerk-mad()-Y", "tBodyGyroJerkMag-mean()", "fBodyAccJerk-bandsEnergy()-1,8",
-        "tBodyGyroJerk-iqr()-Y", "fBodyAccJerk-entropy()-Y", "tBodyAccJerkMag-mean()",
-        "fBodyAccMag-entropy()", "tBodyAccJerk-entropy()-X", "fBodyAccJerk-entropy()-X",
-        "tBodyAccJerk-energy()-X", "tBodyGyroJerk-entropy()-Z", "fBodyBodyAccJerkMag-mean()",
-        "tBodyAccJerk-mad()-Z", "fBodyAcc-iqr()-X", "tBodyGyro-iqr()-Y",
-        "tGravityAcc-arCoeff()-Z,1", "fBodyAcc-bandsEnergy()-1,8", "tGravityAcc-mad()-X",
-        "tGravityAccMag-std()", "tGravityAcc-arCoeff()-Z,2", "tBodyAccMag-arCoeff()2",
-        "fBodyAccMag-mad()", "fBodyAccMag-max()", "tBodyAccMag-mad()",
-        "fBodyGyro-maxInds-Z", "tGravityAcc-mad()-Y", "fBodyAcc-bandsEnergy()-1,24",
-        "fBodyAcc-std()-X", "tGravityAcc-arCoeff()-Y,1", "tGravityAcc-arCoeff()-Y,2",
-        "fBodyGyro-maxInds-X", "tGravityAcc-arCoeff()-Y,4", "tGravityAcc-std()-X",
-        "tGravityAcc-arCoeff()-Z,3", "tGravityAcc-entropy()-X", "tBodyAcc-std()-X",
-        "fBodyAcc-max()-X", "tBodyAccMag-std()", "fBodyAccMag-meanFreq()",
-        "tGravityAcc-arCoeff()-Y,3", "tGravityAccMag-mad()", "tGravityAccMag-sma()",
-        "fBodyAccMag-energy()", "tBodyAccMag-energy()", "tBodyAccJerk-correlation()-X,Y",
-        "tGravityAcc-std()-Y", "tBodyGyroJerk-mad()-X", "fBodyAccMag-sma()",
-        "tGravityAcc-min()-X", "tGravityAcc-mean()-X", "tBodyAcc-mad()-X",
+        "tBodyAccJerk-std()-X", "tBodyAccJerkMag-energy()", "fBodyAccJerk-bandsEnergy()-1,16", 
+        "fBodyAccJerk-max()-X", "fBodyAccJerk-bandsEnergy()-1,24", "tBodyGyroJerk-mad()-Z", 
+        "fBodyAccJerk-bandsEnergy()-1,16", "fBodyAccJerk-std()-X", "fBodyAcc-entropy()-X", 
+        "fBodyAcc-mad()-X", "tBodyAccJerk-sma()", "fBodyAccJerk-mean()-X", 
+        "tBodyGyroJerk-sma()", "tBodyAccJerk-iqr()-X", "tBodyGyroJerk-iqr()-Z", 
+        "fBodyAccJerk-mean()-Y", "tBodyAcc-correlation()-X,Y", "tBodyAccJerkMag-sma()", 
+        "tBodyGyroJerk-iqr()-X", "tBodyAccJerk-mad()-Y", "fBodyAccJerk-max()-Y", 
+        "fBodyAcc-bandsEnergy()-9,16", "fBodyAccJerk-mad()-X", "fBodyAccJerk-bandsEnergy()-9,16", 
+        "tBodyAccJerk-entropy()-Y", "fBodyAccJerk-energy()-X", "tGravityAccMag-arCoeff()1", 
+        "tGravityAcc-arCoeff()-X,1", "fBodyAcc-energy()-X", "tBodyAccMag-arCoeff()1", 
+        "tGravityAcc-arCoeff()-X,3", "tBodyAcc-max()-X", "tGravityAcc-arCoeff()-X,2", 
+        "fBodyAcc-mean()-X", "fBodyAccMag-std()", "tBodyAccJerkMag-iqr()", 
+        "fBodyAccJerk-maxInds-X", "fBodyAcc-bandsEnergy()-1,16", "tGravityAcc-arCoeff()-X,4", 
+        "fBodyAccJerk-mad()-Y", "tBodyGyroJerkMag-mean()", "fBodyAccJerk-bandsEnergy()-1,8", 
+        "tBodyGyroJerk-iqr()-Y", "fBodyAccJerk-entropy()-Y", "tBodyAccJerkMag-mean()", 
+        "fBodyAccMag-entropy()", "tBodyAccJerk-entropy()-X", "fBodyAccJerk-entropy()-X", 
+        "tBodyAccJerk-energy()-X", "tBodyGyroJerk-entropy()-Z", "fBodyBodyAccJerkMag-mean()", 
+        "tBodyAccJerk-mad()-Z", "fBodyAcc-iqr()-X", "tBodyGyro-iqr()-Y", 
+        "tGravityAcc-arCoeff()-Z,1", "fBodyAcc-bandsEnergy()-1,8", "tGravityAcc-mad()-X", 
+        "tGravityAccMag-std()", "tGravityAcc-arCoeff()-Z,2", "tBodyAccMag-arCoeff()2", 
+        "fBodyAccMag-mad()", "fBodyAccMag-max()", "tBodyAccMag-mad()", 
+        "fBodyGyro-maxInds-Z", "tGravityAcc-mad()-Y", "fBodyAcc-bandsEnergy()-1,24", 
+        "fBodyAcc-std()-X", "tGravityAcc-arCoeff()-Y,1", "tGravityAcc-arCoeff()-Y,2", 
+        "fBodyGyro-maxInds-X", "tGravityAcc-arCoeff()-Y,4", "tGravityAcc-std()-X", 
+        "tGravityAcc-arCoeff()-Z,3", "tGravityAcc-entropy()-X", "tBodyAcc-std()-X", 
+        "fBodyAcc-max()-X", "tBodyAccMag-std()", "fBodyAccMag-meanFreq()", 
+        "tGravityAcc-arCoeff()-Y,3", "tGravityAccMag-mad()", "tGravityAccMag-sma()", 
+        "fBodyAccMag-energy()", "tBodyAccMag-energy()", "tBodyAccJerk-correlation()-X,Y", 
+        "tGravityAcc-std()-Y", "tBodyGyroJerk-mad()-X", "fBodyAccMag-sma()", 
+        "tGravityAcc-min()-X", "tGravityAcc-mean()-X", "tBodyAcc-mad()-X", 
         "tGravityAcc-mad()-Z", "fBodyAcc-meanFreq()-Z"
     ]
 
 
     for name in feature_list_slim_92:
-        # Tente d'ajouter la feature calculée. Si elle n'est pas présente (à cause d'un PROXY manquant), ajoute 0.0.
-        final_vector.append(calculated_features.get(name, 0.0))
-
+        final_vector.append(calculated_features.get(name, 0.0)) 
+    
     return np.array(final_vector)
 
 
 # --- FONCTION DE PRÉDICTION NAP (Module 1 - Simulation du Modèle) ---
 
 def model_predict_nap(features):
-    # Simuler la logique du Random Forest SLIM entraîné.
-    # EN PRODUCTION: Charger le modèle via joblib.load('modele_slim.joblib')
-    if np.mean(np.abs(features)) < 0.5:
-         return 0 # Repos
-    elif np.mean(np.abs(features)) < 1.5:
-         return 1 # Léger
+    if RF_CLASSIFIER_SLIM is not None:
+        prediction = RF_CLASSIFIER_SLIM.predict(features.reshape(1, -1))
+        return int(prediction[0])
     else:
-         return 2 # Intense
+        # Logique de simulation pour le cas où le modèle ne charge pas
+        # Utilisation de l'amplitude moyenne comme proxy pour la démo
+        amplitude = np.mean(np.abs(features))
+        if amplitude < 0.5:
+             return 0 # Repos
+        elif amplitude < 1.5:
+             return 1 # Léger
+        else:
+             return 2 # Intense
 
 
 # --- CONTRÔLEUR PRINCIPAL (Cloud Function) ---
 
 @app.post("/analyze_vitals")
 def analyze_vitals(data: SensorData):
-
+    
     try:
-        # 1. PRÉPARATION DES DONNÉES
+        # 1. PRÉPARATION DES DONNÉES 
         ppg_buffer = np.array(data.PPG_IR)
-        acc_buffer = np.array([data.ACC_X, data.ACC_Y, data.ACC_Z]).T
+        acc_buffer = np.array([data.ACC_X, data.ACC_Y, data.ACC_Z]).T 
         gyro_buffer = np.array([data.GYRO_X, data.GYRO_Y, data.GYRO_Z]).T
-
-        # Le contrat prévoit environ 800 échantillons PPG (100Hz*8s) et 400 ACC/GYRO (50Hz*8s)
+        
         if ppg_buffer.size < 790 or acc_buffer.shape[0] < 390:
              raise HTTPException(status_code=400, detail="Buffer de données incomplet. Attendu ~800 PPG et ~400 ACC/GYRO.")
 
@@ -326,9 +344,9 @@ def analyze_vitals(data: SensorData):
         # 3. MODULE 1: CONTEXTE MOUVEMENT (Calcul et Prédiction)
         features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
         nap_mouvement = model_predict_nap(features_92)
-
+        
         # 4. CLASSIFICATION FINALE (Règles Logiques SCAM)
-
+        
         statut_anomalie = "Normal"
         alerte_active = False
 
@@ -336,9 +354,9 @@ def analyze_vitals(data: SensorData):
             if fc_corrigee > SEUIL_FC_STRESS:
                 statut_anomalie = "ALERTE: Stress Mental Sévère (FC au repos > Seuil)"
                 alerte_active = True
-
+        
         # 5. ÉCRITURE DANS SUPABASE (DBaaS)
-
+        
         result_payload = {
             "timestamp": pd.Timestamp.now().isoformat(),
             "fc_corrigee_bpm": round(fc_corrigee, 2),
@@ -346,18 +364,17 @@ def analyze_vitals(data: SensorData):
             "statut_alerte": statut_anomalie,
             "is_critical": alerte_active
         }
-
+        
         if supabase:
-            # Écriture dans la table Supabase (Doit exister: 'vitals_analysis')
+            # Écriture dans la table Supabase (vitals_analysis)
             response = supabase.table('vitals_analysis').insert(result_payload).execute()
             if response.data is None:
                  logging.error(f"Erreur Supabase: {response.error}")
-
+                 
         return {"status": "OK", "analysis": result_payload}
 
     except HTTPException as h_e:
         raise h_e
     except Exception as e:
         logging.error(f"Erreur d'exécution IA: {e}")
-        # Envoie une exception HTTP 500 si le traitement échoue
         raise HTTPException(status_code=500, detail=f"Erreur interne de traitement IA: {str(e)}")
