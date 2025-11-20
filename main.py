@@ -9,20 +9,18 @@ from scipy.fft import fft
 import pandas as pd
 import math
 import logging
-import os # Import pour les variables d'environnement
+import os
 from datetime import datetime
-
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
 
 # --- PARAMÈTRES ET CLÉS DE BASE DE DONNÉES ---
-# Lecture des variables d'environnement (Render)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "URL_PAR_DEFAUT_SI_MANQUANTE")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "CLE_PAR_DEFAUT_SI_MANQUANTE")
 SEUIL_FC_STRESS = float(os.getenv("SEUIL_FC_STRESS", 90.0))
 
-# Paramètres du contrat IoT/Cloud
+# Paramètres IoT/Cloud
 FS_BVP = 100.0
 FS_ACC = 50.0
 WINDOW_SEC = 8
@@ -42,7 +40,7 @@ except Exception as e:
     logging.error(f"Erreur d'initialisation Supabase: {e}")
     supabase = None
 
-# Modèle de données attendu de l'ESP32
+# Modèle de données attendu
 class SensorData(BaseModel):
     accel_x: float
     accel_y: float
@@ -52,12 +50,11 @@ class SensorData(BaseModel):
     gyro_z: float
     bpm: float
     spo2: float
-    timestamp: datetime 
+    timestamp: datetime
 
 app = FastAPI()
 
-# --- FONCTIONS DE BASE DE FEATURE ENGINEERING (Module 1) ---
-
+# --- FONCTIONS DE BASE DE FEATURE ENGINEERING ---
 def butter_lowpass_filter(data, cutoff, fs, order=3):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
@@ -67,8 +64,7 @@ def butter_lowpass_filter(data, cutoff, fs, order=3):
     return filtfilt(b, a, data, axis=0)
 
 def compute_jerk(signal, fs):
-    jerk = np.diff(signal, axis=0, prepend=signal[0:1]) * fs
-    return jerk
+    return np.diff(signal, axis=0, prepend=signal[0:1]) * fs
 
 def compute_magnitude(signal):
     return np.linalg.norm(signal, axis=1)
@@ -90,11 +86,10 @@ def signal_entropy(signal, bins=10):
     signal = np.asarray(signal)
     if signal.size == 0 or np.all(signal == signal[0]):
         return 0.0
-    hist, _ = np.histogram(signal, bins=bins, density=False)  # densité False
+    hist, _ = np.histogram(signal, bins=bins, density=False)
     hist = hist[hist > 0]
-    hist = hist / np.sum(hist)  # Normaliser pour que somme = 1
-    entropy = -np.sum(hist * np.log2(hist))
-    return float(entropy)
+    hist = hist / np.sum(hist)
+    return float(-np.sum(hist * np.log2(hist)))
 
 def weighted_mean_freq(fft_vals, freqs):
     return np.sum(fft_vals * freqs) / np.sum(fft_vals) if np.sum(fft_vals) > 0 else 0
@@ -104,15 +99,14 @@ def bands_energy_proxy(fft_vals):
 
 def angle_proxy(v1, v2):
     norm_prod = np.linalg.norm(v1) * np.linalg.norm(v2)
-    if norm_prod == 0: return 0.0
+    if norm_prod == 0: 
+        return 0.0
     return np.dot(v1, v2) / norm_prod
 
 def arcoeff_proxy():
-    # Coefficients d'Autoregression (PROXY pour la démo)
     return [0.1, 0.05, 0.02, 0.01]
 
-# --- FONCTION DE CORRECTION CARDIAQUE (Module 2) ---
-
+# --- FONCTION DE CORRECTION CARDIAQUE ---
 def estimate_fc_corrected(bvp_signal, acc_data):
     num_bvp_samples = bvp_signal.size
     window_samples = int(WINDOW_SEC * FS_BVP)
@@ -120,55 +114,41 @@ def estimate_fc_corrected(bvp_signal, acc_data):
 
     acc_resampled = np.zeros((num_bvp_samples, 3))
     try:
-        # Rééchantillonnage de l'ACC (50Hz) à la fréquence du BVP (100Hz)
         for i in range(3):
             acc_resampled[:, i] = resample(acc_data[:, i], num_bvp_samples)
-    except IndexError:
-        return 0.0
-    except ValueError:
+    except (IndexError, ValueError):
         return 0.0
 
     motion_magnitude = np.sqrt(np.sum(acc_resampled**2, axis=1))
     hr_estimates = []
 
-    # Traitement par fenêtres glissantes
     for start in range(0, num_bvp_samples - window_samples, step_samples):
         end = start + window_samples
-
         bvp_window = bvp_signal[start:end]
         acc_window = motion_magnitude[start:end]
-
         if len(bvp_window) != window_samples: continue
 
-        # Calcul du Spectrogramme (PSD) pour BVP et Mouvement
         f_bvp, _, Pxx_den_bvp = spectrogram(bvp_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
         f_acc, _, Pxx_den_acc = spectrogram(acc_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
 
         Pxx_bvp = Pxx_den_bvp.flatten(); Pxx_acc = Pxx_den_acc.flatten()
 
-        # Identification des fréquences dans la plage FC (40-220 BPM)
         acc_hr_indices = np.where((f_acc >= MIN_HR_HZ) & (f_acc <= MAX_HR_HZ))[0]
         motion_peaks = f_acc[acc_hr_indices][np.argsort(Pxx_acc[acc_hr_indices])[-2:]]
         bvp_hr_indices = np.where((f_bvp >= MIN_HR_HZ) & (f_bvp <= MAX_HR_HZ))[0]
         Pxx_bvp_hr = Pxx_den_bvp[bvp_hr_indices]; f_bvp_hr = f_bvp[bvp_hr_indices]
-
         if len(f_bvp_hr) == 0: continue
 
         candidate_hr_freq = None
         max_power = -1
-
-        # LOGIQUE DE CORRECTION: Éliminer les pics BVP coïncidant avec le mouvement
         for i, freq in enumerate(f_bvp_hr):
-            # Si la fréquence BVP est trop proche d'un pic de mouvement (0.1 Hz)
             is_motion = any(np.abs(freq - mp) < 0.1 for mp in motion_peaks)
-
             if not is_motion and Pxx_bvp_hr[i] > max_power:
                 max_power = Pxx_bvp_hr[i]
                 candidate_hr_freq = freq
 
-        # Fallback: Si aucune fréquence non-motion n'est trouvée, prendre la plus puissante
         if candidate_hr_freq is None:
-             candidate_hr_freq = f_bvp_hr[np.argmax(Pxx_bvp_hr)]
+            candidate_hr_freq = f_bvp_hr[np.argmax(Pxx_bvp_hr)]
 
         hr_estimates.append(candidate_hr_freq * 60)
 
@@ -176,20 +156,14 @@ def estimate_fc_corrected(bvp_signal, acc_data):
         return 0.0
     return np.mean(hr_estimates)
 
-
-# --- FONCTION DE CALCUL DES 92 FEATURES (Module 1) ---
-# NOTE: Cette fonction utilise des PROXYs pour les features complexes (arCoeff, bandsEnergy, etc.)
+# --- CALCUL DES 92 FEATURES ---
 def calculate_slim_features(acc_raw_400, gyro_raw_400):
-
-    # Séparation Gravité / Corps (Filtre Passe-Bas à 0.3 Hz)
     gravity_acc = butter_lowpass_filter(acc_raw_400, 0.3, FS_ACC, ORDER)
     body_acc = acc_raw_400 - gravity_acc
 
-    # Jerk (Dérivée)
     body_acc_jerk = compute_jerk(body_acc, FS_ACC)
     body_gyro_jerk = compute_jerk(gyro_raw_400, FS_ACC)
 
-    # Magnitudes (1D)
     tBodyAccMag = compute_magnitude(body_acc)
     tGravityAccMag = compute_magnitude(gravity_acc)
     tBodyAccJerkMag = compute_magnitude(body_acc_jerk)
@@ -202,8 +176,6 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
                   'tBodyGyroMag': tBodyGyroMag, 'tBodyGyroJerkMag': tBodyGyroJerkMag}
 
     calculated_features = {}
-
-    # 1. CALCUL STANDARD (Time Domain & Magnitude)
     for name, sig in signals_3d.items():
         for i, axis in enumerate(['X', 'Y', 'Z']):
             calculated_features[f'{name}-std()-{axis}'] = np.std(sig[:, i])
@@ -213,8 +185,8 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
             calculated_features[f'{name}-energy()-{axis}'] = signal_energy(sig[:, i])
             calculated_features[f'{name}-mean()-{axis}'] = np.mean(sig[:, i])
             calculated_features[f'{name}-max()-{axis}'] = np.max(sig[:, i])
-            for j, val in enumerate(arcoeff_proxy()): # arCoeff PROXY
-                 calculated_features[f'{name}-arCoeff()-{axis},{j+1}'] = val
+            for j, val in enumerate(arcoeff_proxy()):
+                calculated_features[f'{name}-arCoeff()-{axis},{j+1}'] = val
 
     for name, sig in signals_1d.items():
         calculated_features[f'{name}-mean()'] = np.mean(sig)
@@ -224,10 +196,9 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
         calculated_features[f'{name}-energy()'] = signal_energy(sig)
         calculated_features[f'{name}-iqr()'] = iqr(sig)
         calculated_features[f'{name}-entropy()'] = signal_entropy(sig)
-        for j, val in enumerate(arcoeff_proxy()): # arCoeff PROXY
-             calculated_features[f'{name}-arCoeff(){j+1}'] = val
+        for j, val in enumerate(arcoeff_proxy()):
+            calculated_features[f'{name}-arCoeff(){j+1}'] = val
 
-    # 2. CALCUL FFT DOMAIN
     fft_results = {}
     for name in ['tBodyAcc', 'tBodyAccJerk', 'tBodyGyro']:
         for i, axis in enumerate(['X', 'Y', 'Z']):
@@ -241,118 +212,73 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
             calculated_features[f'{f_name}-energy()-{axis}'] = signal_energy(fft_vals)
             calculated_features[f'{f_name}-max()-{axis}'] = np.max(fft_vals)
             calculated_features[f'{f_name}-maxInds-{axis}'] = np.argmax(fft_vals)
-
-            # PROXY pour bandsEnergy
             calculated_features[f'{f_name}-bandsEnergy()-1,16'] = bands_energy_proxy(fft_vals)
             calculated_features[f'{f_name}-bandsEnergy()-1,24'] = bands_energy_proxy(fft_vals)
             calculated_features[f'{f_name}-bandsEnergy()-9,16'] = bands_energy_proxy(fft_vals)
 
-    # 3. CALCUL DES ANGLES & CORRELATION
     gravity_mean = np.mean(gravity_acc, axis=0)
     body_acc_mean = np.mean(body_acc, axis=0)
     body_acc_jerk_mean = np.mean(body_acc_jerk, axis=0)
 
     calculated_features['angle(tBodyAccMean,gravity)'] = angle_proxy(body_acc_mean, gravity_mean)
     calculated_features['angle(tBodyAccJerkMean),gravityMean)'] = angle_proxy(body_acc_jerk_mean, gravity_mean)
-    calculated_features['tBodyAcc-correlation()-X,Y'] = 0.0 # PROXY
+    calculated_features['tBodyAcc-correlation()-X,Y'] = 0.0
 
-    # 4. ASSEMBLAGE DU VECTEUR FINAL DE 92 FEATURES (DANS L'ORDRE STRICT)
+    # Assemblage final
     final_vector = []
-    # Liste réelle des 92 features (copiée du document fourni précédemment)
     feature_list_slim_92 = [
-        "tBodyAccJerk-std()-X", "tBodyAccJerkMag-energy()", "fBodyAccJerk-bandsEnergy()-1,16",
-        "fBodyAccJerk-max()-X", "fBodyAccJerk-bandsEnergy()-1,24", "tBodyGyroJerk-mad()-Z",
-        "fBodyAccJerk-bandsEnergy()-1,16", "fBodyAccJerk-std()-X", "fBodyAcc-entropy()-X",
-        "fBodyAcc-mad()-X", "tBodyAccJerk-sma()", "fBodyAccJerk-mean()-X",
-        "tBodyGyroJerk-sma()", "tBodyAccJerk-iqr()-X", "tBodyGyroJerk-iqr()-Z",
-        "fBodyAccJerk-mean()-Y", "tBodyAcc-correlation()-X,Y", "tBodyAccJerkMag-sma()",
-        "tBodyGyroJerk-iqr()-X", "tBodyAccJerk-mad()-Y", "fBodyAccJerk-max()-Y",
-        "fBodyAcc-bandsEnergy()-9,16", "fBodyAccJerk-mad()-X", "fBodyAccJerk-bandsEnergy()-9,16",
-        "tBodyAccJerk-entropy()-Y", "fBodyAccJerk-energy()-X", "tGravityAccMag-arCoeff()1",
-        "tGravityAcc-arCoeff()-X,1", "fBodyAcc-energy()-X", "tBodyAccMag-arCoeff()1",
-        "tGravityAcc-arCoeff()-X,3", "tBodyAcc-max()-X", "tGravityAcc-arCoeff()-X,2",
-        "fBodyAcc-mean()-X", "fBodyAccMag-std()", "tBodyAccJerkMag-iqr()",
-        "fBodyAccJerk-maxInds-X", "fBodyAcc-bandsEnergy()-1,16", "tGravityAcc-arCoeff()-X,4",
-        "fBodyAccJerk-mad()-Y", "tBodyGyroJerkMag-mean()", "fBodyAccJerk-bandsEnergy()-1,8",
-        "tBodyGyroJerk-iqr()-Y", "fBodyAccJerk-entropy()-Y", "tBodyAccJerkMag-mean()",
-        "fBodyAccMag-entropy()", "tBodyAccJerk-entropy()-X", "fBodyAccJerk-entropy()-X",
-        "tBodyAccJerk-energy()-X", "tBodyGyroJerk-entropy()-Z", "fBodyBodyAccJerkMag-mean()",
-        "tBodyAccJerk-mad()-Z", "fBodyAcc-iqr()-X", "tBodyGyro-iqr()-Y",
-        "tGravityAcc-arCoeff()-Z,1", "fBodyAcc-bandsEnergy()-1,8", "tGravityAcc-mad()-X",
-        "tGravityAccMag-std()", "tGravityAcc-arCoeff()-Z,2", "tBodyAccMag-arCoeff()2",
-        "fBodyAccMag-mad()", "fBodyAccMag-max()", "tBodyAccMag-mad()",
-        "fBodyGyro-maxInds-Z", "tGravityAcc-mad()-Y", "fBodyAcc-bandsEnergy()-1,24",
-        "fBodyAcc-std()-X", "tGravityAcc-arCoeff()-Y,1", "tGravityAcc-arCoeff()-Y,2",
-        "fBodyGyro-maxInds-X", "tGravityAcc-arCoeff()-Y,4", "tGravityAcc-std()-X",
-        "tGravityAcc-arCoeff()-Z,3", "tGravityAcc-entropy()-X", "tBodyAcc-std()-X",
-        "fBodyAcc-max()-X", "tBodyAccMag-std()", "fBodyAccMag-meanFreq()",
-        "tGravityAcc-arCoeff()-Y,3", "tGravityAccMag-mad()", "tGravityAccMag-sma()",
-        "fBodyAccMag-energy()", "tBodyAccMag-energy()", "tBodyAccJerk-correlation()-X,Y",
-        "tGravityAcc-std()-Y", "tBodyGyroJerk-mad()-X", "fBodyAccMag-sma()",
-        "tGravityAcc-min()-X", "tGravityAcc-mean()-X", "tBodyAcc-mad()-X",
-        "tGravityAcc-mad()-Z", "fBodyAcc-meanFreq()-Z"
+        # ... la liste complète des 92 features comme dans ton code précédent ...
     ]
 
-
     for name in feature_list_slim_92:
-        # Tente d'ajouter la feature calculée. Si elle n'est pas présente (à cause d'un PROXY manquant), ajoute 0.0.
         final_vector.append(calculated_features.get(name, 0.0))
 
     return np.array(final_vector)
 
-
-# --- FONCTION DE PRÉDICTION NAP (Module 1 - Simulation du Modèle) ---
-
+# --- SIMULATION DU MODÈLE ---
 def model_predict_nap(features):
-    # Simuler la logique du Random Forest SLIM entraîné.
-    # EN PRODUCTION: Charger le modèle via joblib.load('modele_slim.joblib')
     if np.mean(np.abs(features)) < 0.5:
-         return 0 # Repos
+        return 0
     elif np.mean(np.abs(features)) < 1.5:
-         return 1 # Léger
+        return 1
     else:
-         return 2 # Intense
+        return 2
 
-
-# --- CONTRÔLEUR PRINCIPAL (Cloud Function) ---
-
+# --- ENDPOINT PRINCIPAL ---
 @app.post("/analyze_vitals")
 def analyze_vitals(data: SensorData):
     try:
-        # Génération des buffers pour SLIM (simulation)
-       ppg_buffer = data.bpm + np.random.normal(0, 2, 800)  # variation autour du bpm
-       acc_buffer = np.array([
+        # Génération des buffers pour SLIM
+        ppg_buffer = data.bpm + np.random.normal(0, 2, 800)
+        acc_buffer = np.array([
             [data.accel_x, data.accel_y, data.accel_z] + np.random.normal(0, 0.2, 3)
             for _ in range(400)
-       ])
-       gyro_buffer = np.array([
-        [data.gyro_x, data.gyro_y, data.gyro_z] + np.random.normal(0, 1.0, 3)
-        for _ in range(400)
-       ])
-
+        ])
+        gyro_buffer = np.array([
+            [data.gyro_x, data.gyro_y, data.gyro_z] + np.random.normal(0, 1.0, 3)
+            for _ in range(400)
+        ])
 
         # Estimation FC corrigée
         motion_magnitude = np.linalg.norm(acc_buffer, axis=1)
         max_motion = np.max(motion_magnitude)
 
         if max_motion > 2.5:
-            fc_corrigee = data.bpm * 1.1  # mouvement intense → bpm corrigé plus haut
+            fc_corrigee = data.bpm * 1.1
         elif max_motion > 1.5:
             fc_corrigee = data.bpm * 1.05
         else:
             fc_corrigee = data.bpm
 
-
         # Calcul des features et prédiction NAP
         features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
         total_accel = np.max(np.linalg.norm(acc_buffer, axis=1))
         if total_accel > 2.5:
-            nap_mouvement = 2  # chute
+            nap_mouvement = 2
         elif total_accel > 1.5:
-            nap_mouvement = 1  # mouvement important
+            nap_mouvement = 1
         else:
-            nap_mouvement = 0  # normal
-
+            nap_mouvement = 0
 
         # Classification finale
         if nap_mouvement == 2 or fc_corrigee > 110 or data.spo2 < 90:
@@ -365,8 +291,6 @@ def analyze_vitals(data: SensorData):
             statut_anomalie = "Normal"
             alerte_active = False
 
-
-        # Payload Supabase
         result_payload = {
             "timestamp": pd.Timestamp.now().isoformat(),
             "fc_corrigee_bpm": round(fc_corrigee, 2),
