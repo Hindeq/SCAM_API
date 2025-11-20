@@ -87,12 +87,13 @@ def signal_energy(signal):
     return np.sum(signal**2) / len(signal)
 
 def signal_entropy(signal):
-    if len(signal) == 0 or np.all(signal == signal[0]):
-        return 0.0  # Signal vide ou constant
-    hist, _ = np.histogram(signal, bins=10, density=True)
-    hist = hist[hist > 0]  # Ignorer bins vides
-    if len(hist) == 0:
+    if len(signal) == 0:
         return 0.0
+    if np.all(signal == signal[0]):  # signal constant
+        return 0.0
+    bins = min(10, len(signal))      # pas plus de bins que de points
+    hist, _ = np.histogram(signal, bins=bins, density=True)
+    hist = hist[hist > 0]
     return -np.sum(hist * np.log2(hist))
 
 
