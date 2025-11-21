@@ -310,17 +310,44 @@ def analyze_vitals(data: SensorData):
         else:
             nap_mouvement = 0
             
-        # --- NOUVELLE CLASSIFICATION ---
+        # --- NOUVELLE CLASSIFICATION --         
         def classify_vitals(nap_mouvement, fc_corrigee, spo2):
-            if spo2 < 85 or fc_corrigee > 120 or (nap_mouvement == 2 and (fc_corrigee > 110 or spo2 < 90)):
+            """
+            Classification complète des signes vitaux
+            nap_mouvement : 0 = calme, 1 = modéré, 2 = intense
+            fc_corrigee : fréquence cardiaque corrigée (bpm)
+            spo2 : saturation en oxygène (%)
+            """
+            # Cas critique absolu
+            if spo2 < 85 or fc_corrigee > 120:
                 statut_anomalie = "Critique"
                 alerte_active = True
-            elif spo2 < 90 or fc_corrigee > 110 or (nap_mouvement == 1 and (fc_corrigee > 100 or spo2 < 95)):
+
+            # Mouvement intense mais bpm normal -> Normal
+            elif nap_mouvement == 2 and 50 <= fc_corrigee <= 110 and spo2 >= 90:
+                statut_anomalie = "Normal"
+                alerte_active = False
+
+            # Mouvement intense mais bpm trop faible -> Alerte
+            elif nap_mouvement == 2 and fc_corrigee < 50:
                 statut_anomalie = "Alerte"
                 alerte_active = True
+
+            # Mouvement modéré -> Alerte si bpm > 100 ou SpO₂ < 95
+            elif nap_mouvement == 1 and (fc_corrigee > 100 or spo2 < 95):
+                statut_anomalie = "Alerte"
+                alerte_active = True
+
+            # Pas de mouvement mais bpm > 100 -> Alerte
+            elif nap_mouvement == 0 and fc_corrigee > 100:
+                statut_anomalie = "Alerte"
+                alerte_active = True
+
+            # Pas de mouvement et bpm normal -> Normal
             else:
                 statut_anomalie = "Normal"
                 alerte_active = False
+
             return statut_anomalie, alerte_active
 
         # Appel dans l'API
