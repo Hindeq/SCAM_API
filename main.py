@@ -11,6 +11,8 @@ import math
 import logging
 import os
 from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +43,7 @@ except Exception as e:
     supabase = None
 
 # Modèle de données attendu
+
 class SensorData(BaseModel):
     accel_x: float
     accel_y: float
@@ -50,7 +53,8 @@ class SensorData(BaseModel):
     gyro_z: float
     bpm: float
     spo2: float
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
+
 
 app = FastAPI()
 
