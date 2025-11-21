@@ -309,18 +309,22 @@ def analyze_vitals(data: SensorData):
             nap_mouvement = 1
         else:
             nap_mouvement = 0
+            
+        # --- NOUVELLE CLASSIFICATION ---
+        def classify_vitals(nap_mouvement, fc_corrigee, spo2):
+            if spo2 < 85 or fc_corrigee > 120 or (nap_mouvement == 2 and (fc_corrigee > 110 or spo2 < 90)):
+                statut_anomalie = "Critique"
+                alerte_active = True
+            elif spo2 < 90 or fc_corrigee > 110 or (nap_mouvement == 1 and (fc_corrigee > 100 or spo2 < 95)):
+                statut_anomalie = "Alerte"
+                alerte_active = True
+            else:
+                statut_anomalie = "Normal"
+                alerte_active = False
+            return statut_anomalie, alerte_active
 
-        # Classification finale
-        if nap_mouvement == 2 or fc_corrigee > 110 or data.spo2 < 90:
-            statut_anomalie = "Critique"
-            alerte_active = True
-        elif nap_mouvement == 1 or fc_corrigee > 100 or data.spo2 < 95:
-            statut_anomalie = "Alerte"
-            alerte_active = True
-        else:
-            statut_anomalie = "Normal"
-            alerte_active = False
-
+        # Appel dans l'API
+        statut_anomalie, alerte_active = classify_vitals(nap_mouvement, fc_corrigee, data.spo2)
         result_payload = {
             "timestamp": pd.Timestamp.now().isoformat(),
             "fc_corrigee_bpm": round(fc_corrigee, 2),
