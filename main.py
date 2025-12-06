@@ -351,102 +351,74 @@ def detect_pre_alert(fc_hist, spo2_hist, motion_hist, history_len=HISTORY_LEN):
 @app.post("/analyze_vitals_safe")
 def analyze_vitals_safe(data: SensorData):
     try:
-        # --- 1) Normalisation des buffers (valeurs réalistes) ---
-        # MPU6050 : ±16g → diviser par 16384 pour avoir ~±1
-        acc_buffer = np.array([[data.accel_x, data.accel_y, data.accel_z]
-                               for _ in range(400)], dtype=float) / 16384.0
-        # Gyro MPU6050 : ±250°/s → diviser par 131 pour °/s normalisé
-        gyro_buffer = np.array([[data.gyro_x, data.gyro_y, data.gyro_z]
-                                for _ in range(400)], dtype=float) / 131.0
+        # Normalisation sécurisée
+        acc_buffer = np.tile(safe_normalize_acc([data.accel_x, data.accel_y, data.accel_z]), (400,1))
+        gyro_buffer = np.tile(safe_normalize_gyro([data.gyro_x, data.gyro_y, data.gyro_z]), (400,1))
 
-        # --- 2) Estimation FC corrigée (simplifiée avec max motion) ---
+        # Estimation FC
         motion_magnitude = np.linalg.norm(acc_buffer, axis=1)
         max_motion = np.max(motion_magnitude)
+        fc_corrigee = data.bpm * (1.1 if max_motion>2.5 else 1.05 if max_motion>1.5 else 1.0)
+        fc_corrigee = 0.0 if not np.isfinite(fc_corrigee) else fc_corrigee
 
-        if max_motion > 2.5:
-            fc_corrigee = data.bpm * 1.1
-        elif max_motion > 1.5:
-            fc_corrigee = data.bpm * 1.05
-        else:
-            fc_corrigee = data.bpm
-
-        # --- 3) Calcul des 92 features SLIM avec gestion d'erreurs ---
+        # Features SLIM
         try:
             features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
         except Exception as e:
-            logging.error(f"Erreur calcul SLIM features: {e}")
+            logging.error(f"Erreur SLIM: {e}")
             features_92 = np.zeros(92)
 
-        # --- 4) Prédiction mouvement (SLIM) avec fallback ---
+        # Prédiction mouvement
         try:
             nap_mouvement_pred = int(model_predict_nap(features_92))
         except Exception as e:
-            logging.error(f"Erreur prédiction SLIM: {e}")
+            logging.error(f"Erreur SLIM prediction: {e}")
             nap_mouvement_pred = 0
 
-        # --- 5) Mise à jour des buffers historiques (FIFO) ---
-        now_ts = data.timestamp.isoformat() if data.timestamp else datetime.now(timezone.utc).isoformat()
+        nap_mouvement_pred = 0 if nap_mouvement_pred not in [0,1,2] else nap_mouvement_pred
+        data.spo2 = SEUIL_SPO2_NORMAL if not np.isfinite(data.spo2) else data.spo2
 
-        fc_history.append(float(round(fc_corrigee, 2)))
-        spo2_history.append(float(round(data.spo2, 2)))
-        motion_history.append(int(nap_mouvement_pred))
+        # Historique
+        now_ts = data.timestamp.isoformat() if data.timestamp else datetime.now(timezone.utc).isoformat()
+        fc_history.append(float(round(fc_corrigee,2)))
+        spo2_history.append(float(round(data.spo2,2)))
+        motion_history.append(nap_mouvement_pred)
         time_history.append(now_ts)
 
-        # Limiter la taille des buffers
+        # FIFO buffer
         if len(fc_history) > BUFFER_MAX_LEN:
             del fc_history[0:len(fc_history)-BUFFER_MAX_LEN]
             del spo2_history[0:len(spo2_history)-BUFFER_MAX_LEN]
             del motion_history[0:len(motion_history)-BUFFER_MAX_LEN]
             del time_history[0:len(time_history)-BUFFER_MAX_LEN]
 
-        # --- 6) Détection pré-alerte ---
+        # Pré-alerte
         pre_alert = detect_pre_alert(fc_history, spo2_history, motion_history, history_len=min(HISTORY_LEN, len(fc_history)))
 
-        # --- 7) Classification vitale adaptée aux seniors ---
-        def classify_vitals_senior(nap, fc, spo2, pre_alert_flag):
-            if spo2 <= SEUIL_SPO2_CRIT or fc >= SEUIL_FC_DANGER or fc <= SEUIL_FC_LOW - 2:
-                return "Critique", True
-            if pre_alert_flag:
-                return "PreAlerte", False
-            if nap == 2:
-                if fc < SEUIL_FC_LOW:
-                    return "Alerte", True
-                if SEUIL_FC_LOW <= fc <= SEUIL_FC_HIGH and spo2 >= SEUIL_SPO2_NORMAL - 1:
-                    return "Normal", False
-                if fc > SEUIL_FC_HIGH or spo2 < SEUIL_SPO2_LOW:
-                    return "Alerte", True
-            elif nap == 1:
-                if fc > SEUIL_FC_HIGH or spo2 < SEUIL_SPO2_LOW:
-                    return "Alerte", True
-                return "Normal", False
-            else:
-                if fc > SEUIL_FC_HIGH or fc < SEUIL_FC_LOW or spo2 < SEUIL_SPO2_LOW:
-                    return "Alerte", True
-                return "Normal", False
-
+        # Classification
         statut_anomalie, alerte_active = classify_vitals_senior(nap_mouvement_pred, fc_corrigee, data.spo2, pre_alert)
-        if statut_anomalie == "PreAlerte":
-            alerte_active = False
+        if statut_anomalie=="PreAlerte":
+            alerte_active=False
 
-        # --- 8) Préparer le payload et insérer vers Supabase ---
         result_payload = {
             "timestamp": now_ts,
-            "fc_corrigee_bpm": float(round(fc_corrigee, 2)),
+            "fc_corrigee_bpm": round(fc_corrigee,2),
             "nap_mouvement_code": int(nap_mouvement_pred),
             "statut_alerte": statut_anomalie,
             "is_critical": bool(alerte_active)
         }
 
+        # Supabase insert
         if supabase:
             try:
-                response = supabase.table('vitals_analysis').insert(result_payload).execute()
-                if getattr(response, "data", None) is None:
-                    logging.error(f"Erreur Supabase: {getattr(response, 'error', 'unknown')}")
+                resp = supabase.table("vitals_analysis").insert(result_payload).execute()
+                if getattr(resp, "data", None) is None:
+                    logging.error(f"Supabase error: {getattr(resp,'error','unknown')}")
             except Exception as e:
-                logging.error(f"Erreur appel Supabase: {e}")
+                logging.error(f"Supabase insert error: {e}")
 
-        return {"status": "OK", "analysis": result_payload, "debug": {"pre_alert": pre_alert, "history_len": len(fc_history)}}
+        return {"status":"OK","analysis":result_payload,"debug":{"pre_alert":pre_alert,"history_len":len(fc_history)}}
 
     except Exception as e:
-        logging.error(f"Erreur interne analyse_vitals_safe: {e}")
-        raise HTTPException(status_code=500, detail=f"Erreur interne de traitement IA: {str(e)}")
+        logging.error(f"Internal error analyze_vitals_safe: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur interne: {str(e)}")
