@@ -347,6 +347,26 @@ def detect_pre_alert(fc_hist, spo2_hist, motion_hist, history_len=HISTORY_LEN):
     score = sum([cond_spo2, cond_fc, cond_motion])
     return score >= 2
 
+    # --- Fonctions de normalisation sécurisée ---
+    def safe_normalize_acc(acc):
+        """
+        Normalisation MPU6050 ±16g
+        """
+        acc = np.array(acc, dtype=float)
+        # limiter ±16g pour sécurité
+        acc = np.clip(acc, -16*16384, 16*16384)
+        return acc / 16384.0
+    
+    def safe_normalize_gyro(gyro):
+        """
+        Normalisation Gyroscope MPU6050 ±250°/s
+        """
+        gyro = np.array(gyro, dtype=float)
+        # limiter ±250°/s pour sécurité
+        gyro = np.clip(gyro, -250*131, 250*131)
+        return gyro / 131.0
+
+
 # --- ENDPOINT PRINCIPAL / pipeline complet ---
 @app.post("/analyze_vitals_safe")
 def analyze_vitals_safe(data: SensorData):
@@ -354,6 +374,7 @@ def analyze_vitals_safe(data: SensorData):
         # Normalisation sécurisée
         acc_buffer = np.tile(safe_normalize_acc([data.accel_x, data.accel_y, data.accel_z]), (400,1))
         gyro_buffer = np.tile(safe_normalize_gyro([data.gyro_x, data.gyro_y, data.gyro_z]), (400,1))
+
 
         # Estimation FC
         motion_magnitude = np.linalg.norm(acc_buffer, axis=1)
