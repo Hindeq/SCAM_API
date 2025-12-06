@@ -348,24 +348,18 @@ def detect_pre_alert(fc_hist, spo2_hist, motion_hist, history_len=HISTORY_LEN):
     return score >= 2
 
 # --- ENDPOINT PRINCIPAL / pipeline complet ---
-@app.post("/analyze_vitals")
-def analyze_vitals(data: SensorData):
+@app.post("/analyze_vitals_safe")
+def analyze_vitals_safe(data: SensorData):
     try:
-        # --- 1) GÉNÉRATION / RÉCEPTION DES BUFFERS (POC: on re-crée de petites fenêtres) ---
-        # PPG simulated buffer for BVP processing (keep same shape as original)
-        ppg_buffer = np.array(data.bpm) + np.random.normal(0, 2, 800)
+        # --- 1) Normalisation des buffers (valeurs réalistes) ---
+        # MPU6050 : ±16g → diviser par 16384 pour avoir ~±1
+        acc_buffer = np.array([[data.accel_x, data.accel_y, data.accel_z]
+                               for _ in range(400)], dtype=float) / 16384.0
+        # Gyro MPU6050 : ±250°/s → diviser par 131 pour °/s normalisé
+        gyro_buffer = np.array([[data.gyro_x, data.gyro_y, data.gyro_z]
+                                for _ in range(400)], dtype=float) / 131.0
 
-        # Acc & gyro buffers used by SLIM features (400 samples each as in ton code)
-        acc_buffer = np.array([
-            [data.accel_x, data.accel_y, data.accel_z] + np.random.normal(0, 0.2, 3)
-            for _ in range(400)
-        ])
-        gyro_buffer = np.array([
-            [data.gyro_x, data.gyro_y, data.gyro_z] + np.random.normal(0, 1.0, 3)
-            for _ in range(400)
-        ])
-
-        # --- 2) Estimation FC corrigée (conserver ta méthode) ---
+        # --- 2) Estimation FC corrigée (simplifiée avec max motion) ---
         motion_magnitude = np.linalg.norm(acc_buffer, axis=1)
         max_motion = np.max(motion_magnitude)
 
@@ -376,71 +370,65 @@ def analyze_vitals(data: SensorData):
         else:
             fc_corrigee = data.bpm
 
-        # --- 3) Calcul des 92 features SLIM et prédiction DU MOUVEMENT via SLIM ---
-        features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
-        nap_mouvement_pred = int(model_predict_nap(features_92))  # 0/1/2 ; ici tu peux remplacer model_predict_nap par slim_model.predict
+        # --- 3) Calcul des 92 features SLIM avec gestion d'erreurs ---
+        try:
+            features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
+        except Exception as e:
+            logging.error(f"Erreur calcul SLIM features: {e}")
+            features_92 = np.zeros(92)
 
-        # --- 4) Mettre à jour les buffers historiques (FIFO) ---
+        # --- 4) Prédiction mouvement (SLIM) avec fallback ---
+        try:
+            nap_mouvement_pred = int(model_predict_nap(features_92))
+        except Exception as e:
+            logging.error(f"Erreur prédiction SLIM: {e}")
+            nap_mouvement_pred = 0
+
+        # --- 5) Mise à jour des buffers historiques (FIFO) ---
         now_ts = data.timestamp.isoformat() if data.timestamp else datetime.now(timezone.utc).isoformat()
 
-        # append to histories and cap their lengths
         fc_history.append(float(round(fc_corrigee, 2)))
         spo2_history.append(float(round(data.spo2, 2)))
         motion_history.append(int(nap_mouvement_pred))
         time_history.append(now_ts)
 
-        # cap length
+        # Limiter la taille des buffers
         if len(fc_history) > BUFFER_MAX_LEN:
             del fc_history[0:len(fc_history)-BUFFER_MAX_LEN]
             del spo2_history[0:len(spo2_history)-BUFFER_MAX_LEN]
             del motion_history[0:len(motion_history)-BUFFER_MAX_LEN]
             del time_history[0:len(time_history)-BUFFER_MAX_LEN]
 
-        # --- 5) Détection pré-alerte (fenêtre glissante) ---
+        # --- 6) Détection pré-alerte ---
         pre_alert = detect_pre_alert(fc_history, spo2_history, motion_history, history_len=min(HISTORY_LEN, len(fc_history)))
 
-        # --- 6) Classification vitale finale adaptée aux seniors ---
+        # --- 7) Classification vitale adaptée aux seniors ---
         def classify_vitals_senior(nap, fc, spo2, pre_alert_flag):
-            # Cas critique absolu (prioritaire)
             if spo2 <= SEUIL_SPO2_CRIT or fc >= SEUIL_FC_DANGER or fc <= SEUIL_FC_LOW - 2:
                 return "Critique", True
-
-            # Si pré-alerte détectée -> PreAlerte (ne pas confondre avec Critique)
             if pre_alert_flag:
                 return "PreAlerte", False
-
-            # Règles basées sur mouvement SLIM + seuils seniors
             if nap == 2:
-                # mouvement intense : si FC très bas -> alerte
                 if fc < SEUIL_FC_LOW:
                     return "Alerte", True
-                # mouvement intense and FC within acceptable older adult range -> normal
                 if SEUIL_FC_LOW <= fc <= SEUIL_FC_HIGH and spo2 >= SEUIL_SPO2_NORMAL - 1:
                     return "Normal", False
-                # else mild alert
                 if fc > SEUIL_FC_HIGH or spo2 < SEUIL_SPO2_LOW:
                     return "Alerte", True
             elif nap == 1:
-                # activité modérée : alerte si FC au-dessus de seuil élevé ou SpO2 bas
                 if fc > SEUIL_FC_HIGH or spo2 < SEUIL_SPO2_LOW:
                     return "Alerte", True
                 return "Normal", False
-            else:  # nap == 0 : repos
-                # repos mais FC anormale => alerte
-                if fc > SEUIL_FC_HIGH or fc < SEUIL_FC_LOW:
-                    return "Alerte", True
-                if spo2 < SEUIL_SPO2_LOW:
+            else:
+                if fc > SEUIL_FC_HIGH or fc < SEUIL_FC_LOW or spo2 < SEUIL_SPO2_LOW:
                     return "Alerte", True
                 return "Normal", False
 
         statut_anomalie, alerte_active = classify_vitals_senior(nap_mouvement_pred, fc_corrigee, data.spo2, pre_alert)
-
-        # If pre-alert was returned, set a descriptive status
         if statut_anomalie == "PreAlerte":
-            # Pre-alert is not critical yet, but we mark for attention
             alerte_active = False
 
-        # --- 7) Préparer le payload et insérer vers Supabase (format inchangé) ---
+        # --- 8) Préparer le payload et insérer vers Supabase ---
         result_payload = {
             "timestamp": now_ts,
             "fc_corrigee_bpm": float(round(fc_corrigee, 2)),
@@ -460,5 +448,5 @@ def analyze_vitals(data: SensorData):
         return {"status": "OK", "analysis": result_payload, "debug": {"pre_alert": pre_alert, "history_len": len(fc_history)}}
 
     except Exception as e:
-        logging.error(f"Erreur d'exécution IA: {e}")
+        logging.error(f"Erreur interne analyse_vitals_safe: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur interne de traitement IA: {str(e)}")
