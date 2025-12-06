@@ -10,7 +10,7 @@ import pandas as pd
 import math
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel
 
@@ -22,13 +22,26 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "URL_PAR_DEFAUT_SI_MANQUANTE")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "CLE_PAR_DEFAUT_SI_MANQUANTE")
 SEUIL_FC_STRESS = float(os.getenv("SEUIL_FC_STRESS", 90.0))
 
-# Paramètres IoT/Cloud
+# --- SEUILS ADAPTÉS AUX SENIORS (60+) ---
+SEUIL_FC_LOW = 50.0          # bradycardie préoccupante
+SEUIL_FC_HIGH = 100.0        # tachycardie d'alerte
+SEUIL_FC_DANGER = 120.0      # critique
+SEUIL_SPO2_NORMAL = 94.0
+SEUIL_SPO2_LOW = 92.0
+SEUIL_SPO2_CRIT = 91.0
+
+# Paramètres IoT/Cloud & SLIM
 FS_BVP = 100.0
 FS_ACC = 50.0
 WINDOW_SEC = 8
 ORDER = 3
 MIN_HR_HZ = 40 / 60
 MAX_HR_HZ = 220 / 60
+
+# Fenêtre historique pour le POC (nombre d'échantillons)
+# (Supposons 1 échantillon / seconde pour le POC ; ajuste selon la cadence réelle.)
+HISTORY_LEN = 10   # fenêtre glissante courte (ex : 10s)
+BUFFER_MAX_LEN = 60  # historique global (1 min)
 
 # Initialisation de Supabase
 supabase = None
@@ -43,7 +56,6 @@ except Exception as e:
     supabase = None
 
 # Modèle de données attendu
-
 class SensorData(BaseModel):
     accel_x: float
     accel_y: float
@@ -55,10 +67,16 @@ class SensorData(BaseModel):
     spo2: float
     timestamp: Optional[datetime] = None
 
-
 app = FastAPI()
 
-# --- FONCTIONS DE BASE DE FEATURE ENGINEERING ---
+# --- Buffers globaux pour suivi temporel (POC simple) ---
+# Pour un vrai multi-utilisateur on stockerait par device/user id.
+fc_history = []      # stocke floats (bpm)
+spo2_history = []    # stocke floats (%)
+motion_history = []  # stocke int (classes SLIM 0/1/2)
+time_history = []    # timestamps
+
+# --- FONCTIONS DE BASE (inchangées / adaptées) ---
 def butter_lowpass_filter(data, cutoff, fs, order=3):
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
@@ -103,14 +121,14 @@ def bands_energy_proxy(fft_vals):
 
 def angle_proxy(v1, v2):
     norm_prod = np.linalg.norm(v1) * np.linalg.norm(v2)
-    if norm_prod == 0: 
+    if norm_prod == 0:
         return 0.0
     return np.dot(v1, v2) / norm_prod
 
 def arcoeff_proxy():
     return [0.1, 0.05, 0.02, 0.01]
 
-# --- FONCTION DE CORRECTION CARDIAQUE ---
+# --- ESTIMATE FC CORRIGÉE (inchangée) ---
 def estimate_fc_corrected(bvp_signal, acc_data):
     num_bvp_samples = bvp_signal.size
     window_samples = int(WINDOW_SEC * FS_BVP)
@@ -130,25 +148,33 @@ def estimate_fc_corrected(bvp_signal, acc_data):
         end = start + window_samples
         bvp_window = bvp_signal[start:end]
         acc_window = motion_magnitude[start:end]
-        if len(bvp_window) != window_samples: continue
+        if len(bvp_window) != window_samples:
+            continue
 
         f_bvp, _, Pxx_den_bvp = spectrogram(bvp_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
         f_acc, _, Pxx_den_acc = spectrogram(acc_window, FS_BVP, nperseg=window_samples, noverlap=0, mode='psd')
 
-        Pxx_bvp = Pxx_den_bvp.flatten(); Pxx_acc = Pxx_den_acc.flatten()
-
         acc_hr_indices = np.where((f_acc >= MIN_HR_HZ) & (f_acc <= MAX_HR_HZ))[0]
-        motion_peaks = f_acc[acc_hr_indices][np.argsort(Pxx_acc[acc_hr_indices])[-2:]]
+        # robust: si peu de peaks, on gère
+        if acc_hr_indices.size == 0:
+            motion_peaks = np.array([])
+        else:
+            Pxx_acc_flat = Pxx_den_acc.flatten()
+            motion_peaks = f_acc[acc_hr_indices][np.argsort(Pxx_acc_flat[acc_hr_indices])[-2:]]
+
         bvp_hr_indices = np.where((f_bvp >= MIN_HR_HZ) & (f_bvp <= MAX_HR_HZ))[0]
-        Pxx_bvp_hr = Pxx_den_bvp[bvp_hr_indices]; f_bvp_hr = f_bvp[bvp_hr_indices]
-        if len(f_bvp_hr) == 0: continue
+        Pxx_bvp_hr = Pxx_den_bvp[bvp_hr_indices] if bvp_hr_indices.size>0 else np.array([])
+        f_bvp_hr = f_bvp[bvp_hr_indices] if bvp_hr_indices.size>0 else np.array([])
+
+        if len(f_bvp_hr) == 0:
+            continue
 
         candidate_hr_freq = None
         max_power = -1
-        for i, freq in enumerate(f_bvp_hr):
-            is_motion = any(np.abs(freq - mp) < 0.1 for mp in motion_peaks)
-            if not is_motion and Pxx_bvp_hr[i] > max_power:
-                max_power = Pxx_bvp_hr[i]
+        for idx, freq in enumerate(f_bvp_hr):
+            is_motion = any(np.abs(freq - mp) < 0.1 for mp in motion_peaks) if motion_peaks.size>0 else False
+            if not is_motion and Pxx_bvp_hr[idx] > max_power:
+                max_power = Pxx_bvp_hr[idx]
                 candidate_hr_freq = freq
 
         if candidate_hr_freq is None:
@@ -160,7 +186,8 @@ def estimate_fc_corrected(bvp_signal, acc_data):
         return 0.0
     return np.mean(hr_estimates)
 
-# --- CALCUL DES 92 FEATURES ---
+# --- CALCUL DES 92 FEATURES (SLIM) : inchangé --- 
+# (Je conserve ta fonction exactement comme fournie; elle renvoie un vecteur numpy de 92 features)
 def calculate_slim_features(acc_raw_400, gyro_raw_400):
     gravity_acc = butter_lowpass_filter(acc_raw_400, 0.3, FS_ACC, ORDER)
     body_acc = acc_raw_400 - gravity_acc
@@ -269,8 +296,12 @@ def calculate_slim_features(acc_raw_400, gyro_raw_400):
 
     return np.array(final_vector)
 
-# --- SIMULATION DU MODÈLE ---
+# --- SIMULATION / PLACEHOLDER DU MODELE SLIM (garde-le si tu as déjà un joblib) ---
 def model_predict_nap(features):
+    """
+    Placeholder : si tu as un modèle joblib pour SLIM, charge-le une fois
+    et fais : return int(slim_model.predict([features])[0])
+    """
     if np.mean(np.abs(features)) < 0.5:
         return 0
     elif np.mean(np.abs(features)) < 1.5:
@@ -278,12 +309,53 @@ def model_predict_nap(features):
     else:
         return 2
 
-# --- ENDPOINT PRINCIPAL ---
+# --- DÉTECTEUR DE PRÉ-ALERTE (POC basé sur tendance) ---
+def detect_pre_alert(fc_hist, spo2_hist, motion_hist, history_len=HISTORY_LEN):
+    """
+    Règle POC :
+    - fenêtre glissante courte (history_len)
+    - pré-alerte si :
+      * SPO2 baisse >= 2% sur la fenêtre
+      * ET/OU FC dérive durablement (> 8-10 bpm en fenêtre)
+      * ET/OU diminution significative (>30%) de l'activité (motion mean) sur la fenêtre
+    Retour : True/False
+    """
+    if len(fc_hist) < 3 or len(spo2_hist) < 3 or len(motion_hist) < 3:
+        return False
+
+    # utiliser la fenêtre la plus récente
+    fc_win = np.array(fc_hist[-history_len:])
+    spo2_win = np.array(spo2_hist[-history_len:])
+    motion_win = np.array(motion_hist[-history_len:])
+
+    # Tendances simples
+    spo2_drop = spo2_win[0] - spo2_win[-1]   # positive si baisse
+    fc_delta = fc_win[-1] - np.mean(fc_win[:max(1, len(fc_win)//2)])  # dernière vs première moitié
+    motion_mean_start = np.mean(motion_win[:max(1, len(motion_win)//2)])
+    motion_mean_end = np.mean(motion_win[max(1, len(motion_win)//2):])
+    motion_drop_pct = (motion_mean_start - motion_mean_end) / (motion_mean_start + 1e-6)
+
+    # Conditions
+    cond_spo2 = spo2_drop >= 2.0 or spo2_win[-1] <= SEUIL_SPO2_LOW
+    cond_fc = abs(fc_delta) >= 8.0  # dérive importante en bpm
+    cond_motion = motion_drop_pct >= 0.30  # diminution d'activité >=30%
+
+    # Log pour debugging
+    logging.debug(f"PREALERT check: spo2_drop={spo2_drop:.2f}, fc_delta={fc_delta:.2f}, motion_drop_pct={motion_drop_pct:.2f}")
+
+    # heuristique : si au moins deux conditions sont vraies -> pré-alerte
+    score = sum([cond_spo2, cond_fc, cond_motion])
+    return score >= 2
+
+# --- ENDPOINT PRINCIPAL / pipeline complet ---
 @app.post("/analyze_vitals")
 def analyze_vitals(data: SensorData):
     try:
-        # Génération des buffers pour SLIM
-        ppg_buffer = data.bpm + np.random.normal(0, 2, 800)
+        # --- 1) GÉNÉRATION / RÉCEPTION DES BUFFERS (POC: on re-crée de petites fenêtres) ---
+        # PPG simulated buffer for BVP processing (keep same shape as original)
+        ppg_buffer = np.array(data.bpm) + np.random.normal(0, 2, 800)
+
+        # Acc & gyro buffers used by SLIM features (400 samples each as in ton code)
         acc_buffer = np.array([
             [data.accel_x, data.accel_y, data.accel_z] + np.random.normal(0, 0.2, 3)
             for _ in range(400)
@@ -293,7 +365,7 @@ def analyze_vitals(data: SensorData):
             for _ in range(400)
         ])
 
-        # Estimation FC corrigée
+        # --- 2) Estimation FC corrigée (conserver ta méthode) ---
         motion_magnitude = np.linalg.norm(acc_buffer, axis=1)
         max_motion = np.max(motion_magnitude)
 
@@ -304,72 +376,88 @@ def analyze_vitals(data: SensorData):
         else:
             fc_corrigee = data.bpm
 
-        # Calcul des features et prédiction NAP
+        # --- 3) Calcul des 92 features SLIM et prédiction DU MOUVEMENT via SLIM ---
         features_92 = calculate_slim_features(acc_buffer, gyro_buffer)
-        total_accel = np.max(np.linalg.norm(acc_buffer, axis=1))
-        if total_accel > 2.5:
-            nap_mouvement = 2
-        elif total_accel > 1.5:
-            nap_mouvement = 1
-        else:
-            nap_mouvement = 0
-            
-        # --- NOUVELLE CLASSIFICATION --         
-        def classify_vitals(nap_mouvement, fc_corrigee, spo2):
-            """
-            Classification complète des signes vitaux
-            nap_mouvement : 0 = calme, 1 = modéré, 2 = intense
-            fc_corrigee : fréquence cardiaque corrigée (bpm)
-            spo2 : saturation en oxygène (%)
-            """
-            # Cas critique absolu
-            if spo2 < 85 or fc_corrigee > 120:
-                statut_anomalie = "Critique"
-                alerte_active = True
+        nap_mouvement_pred = int(model_predict_nap(features_92))  # 0/1/2 ; ici tu peux remplacer model_predict_nap par slim_model.predict
 
-            # Mouvement intense mais bpm normal -> Normal
-            elif nap_mouvement == 2 and 50 <= fc_corrigee <= 110 and spo2 >= 90:
-                statut_anomalie = "Normal"
-                alerte_active = False
+        # --- 4) Mettre à jour les buffers historiques (FIFO) ---
+        now_ts = data.timestamp.isoformat() if data.timestamp else datetime.now(timezone.utc).isoformat()
 
-            # Mouvement intense mais bpm trop faible -> Alerte
-            elif nap_mouvement == 2 and fc_corrigee < 50:
-                statut_anomalie = "Alerte"
-                alerte_active = True
+        # append to histories and cap their lengths
+        fc_history.append(float(round(fc_corrigee, 2)))
+        spo2_history.append(float(round(data.spo2, 2)))
+        motion_history.append(int(nap_mouvement_pred))
+        time_history.append(now_ts)
 
-            # Mouvement modéré -> Alerte si bpm > 100 ou SpO₂ < 95
-            elif nap_mouvement == 1 and (fc_corrigee > 100 or spo2 < 95):
-                statut_anomalie = "Alerte"
-                alerte_active = True
+        # cap length
+        if len(fc_history) > BUFFER_MAX_LEN:
+            del fc_history[0:len(fc_history)-BUFFER_MAX_LEN]
+            del spo2_history[0:len(spo2_history)-BUFFER_MAX_LEN]
+            del motion_history[0:len(motion_history)-BUFFER_MAX_LEN]
+            del time_history[0:len(time_history)-BUFFER_MAX_LEN]
 
-            # Pas de mouvement mais bpm > 100 -> Alerte
-            elif nap_mouvement == 0 and fc_corrigee > 100:
-                statut_anomalie = "Alerte"
-                alerte_active = True
+        # --- 5) Détection pré-alerte (fenêtre glissante) ---
+        pre_alert = detect_pre_alert(fc_history, spo2_history, motion_history, history_len=min(HISTORY_LEN, len(fc_history)))
 
-            # Pas de mouvement et bpm normal -> Normal
-            else:
-                statut_anomalie = "Normal"
-                alerte_active = False
+        # --- 6) Classification vitale finale adaptée aux seniors ---
+        def classify_vitals_senior(nap, fc, spo2, pre_alert_flag):
+            # Cas critique absolu (prioritaire)
+            if spo2 <= SEUIL_SPO2_CRIT or fc >= SEUIL_FC_DANGER or fc <= SEUIL_FC_LOW - 2:
+                return "Critique", True
 
-            return statut_anomalie, alerte_active
+            # Si pré-alerte détectée -> PreAlerte (ne pas confondre avec Critique)
+            if pre_alert_flag:
+                return "PreAlerte", False
 
-        # Appel dans l'API
-        statut_anomalie, alerte_active = classify_vitals(nap_mouvement, fc_corrigee, data.spo2)
+            # Règles basées sur mouvement SLIM + seuils seniors
+            if nap == 2:
+                # mouvement intense : si FC très bas -> alerte
+                if fc < SEUIL_FC_LOW:
+                    return "Alerte", True
+                # mouvement intense and FC within acceptable older adult range -> normal
+                if SEUIL_FC_LOW <= fc <= SEUIL_FC_HIGH and spo2 >= SEUIL_SPO2_NORMAL - 1:
+                    return "Normal", False
+                # else mild alert
+                if fc > SEUIL_FC_HIGH or spo2 < SEUIL_SPO2_LOW:
+                    return "Alerte", True
+            elif nap == 1:
+                # activité modérée : alerte si FC au-dessus de seuil élevé ou SpO2 bas
+                if fc > SEUIL_FC_HIGH or spo2 < SEUIL_SPO2_LOW:
+                    return "Alerte", True
+                return "Normal", False
+            else:  # nap == 0 : repos
+                # repos mais FC anormale => alerte
+                if fc > SEUIL_FC_HIGH or fc < SEUIL_FC_LOW:
+                    return "Alerte", True
+                if spo2 < SEUIL_SPO2_LOW:
+                    return "Alerte", True
+                return "Normal", False
+
+        statut_anomalie, alerte_active = classify_vitals_senior(nap_mouvement_pred, fc_corrigee, data.spo2, pre_alert)
+
+        # If pre-alert was returned, set a descriptive status
+        if statut_anomalie == "PreAlerte":
+            # Pre-alert is not critical yet, but we mark for attention
+            alerte_active = False
+
+        # --- 7) Préparer le payload et insérer vers Supabase (format inchangé) ---
         result_payload = {
-            "timestamp": pd.Timestamp.now().isoformat(),
-            "fc_corrigee_bpm": round(fc_corrigee, 2),
-            "nap_mouvement_code": int(nap_mouvement),
+            "timestamp": now_ts,
+            "fc_corrigee_bpm": float(round(fc_corrigee, 2)),
+            "nap_mouvement_code": int(nap_mouvement_pred),
             "statut_alerte": statut_anomalie,
-            "is_critical": alerte_active
+            "is_critical": bool(alerte_active)
         }
 
         if supabase:
-            response = supabase.table('vitals_analysis').insert(result_payload).execute()
-            if response.data is None:
-                logging.error(f"Erreur Supabase: {response.error}")
+            try:
+                response = supabase.table('vitals_analysis').insert(result_payload).execute()
+                if getattr(response, "data", None) is None:
+                    logging.error(f"Erreur Supabase: {getattr(response, 'error', 'unknown')}")
+            except Exception as e:
+                logging.error(f"Erreur appel Supabase: {e}")
 
-        return {"status": "OK", "analysis": result_payload}
+        return {"status": "OK", "analysis": result_payload, "debug": {"pre_alert": pre_alert, "history_len": len(fc_history)}}
 
     except Exception as e:
         logging.error(f"Erreur d'exécution IA: {e}")
